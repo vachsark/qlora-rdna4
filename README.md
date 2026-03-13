@@ -4,6 +4,8 @@
 
 AMD's RX 9070 XT (RDNA4, gfx1200/gfx1201) has 16GB VRAM — more than enough for 7B QLoRA training. But the standard quantization library `bitsandbytes` doesn't work on RDNA4. This repo documents the problem, the solution, and provides ready-to-use training scripts.
 
+**We used this to train 5 production models** (Qwen2.5-7B-Instruct) that run daily automated tasks — knowledge evaluation, goal planning, research synthesis, and more. All trained and deployed on a single consumer GPU.
+
 ## The Problem
 
 Two failure modes prevent bitsandbytes from working on RDNA4:
@@ -28,27 +30,47 @@ Instead of using the `transformers` `HqqConfig` integration (which is broken in 
 
 This gives us 4-bit weights with bf16 compute — same effective setup as bitsandbytes NF4, but without any platform-specific kernels.
 
-## Benchmark Results
+## Production Results
+
+We trained 5 task-specific models from Qwen2.5-7B-Instruct using this pipeline:
 
 **Hardware**: AMD RX 9070 XT (RDNA4, gfx1201, 16GB VRAM)
-**Model**: Qwen2.5-7B-Instruct
 **Software**: PyTorch 2.9.1+rocm6.3, Python 3.14
-**Date**: 2026-03-12
+**Date**: 2026-03-13
+
+| Model                | Task                                  | Examples | Peak VRAM | Training Time | max_length |
+| -------------------- | ------------------------------------- | -------- | --------- | ------------- | ---------- |
+| vault-judge-7b       | Knowledge quality evaluation          | 67       | 14.50 GB  | 21 min        | 2048       |
+| vault-planner-7b     | Goal planning & prioritization        | 99       | 12.21 GB  | 14 min        | 1024       |
+| vault-seeder-7b      | Research note synthesis               | 64       | 12.21 GB  | 9 min         | 1024       |
+| vault-analyst-7b     | Technical analysis & recommendations  | 77       | 12.21 GB  | 11 min        | 1024       |
+| vault-reflector-3b\* | Session reflection & pattern analysis | 42       | 11.45 GB  | 11 min        | 2048       |
+
+_\*Reflector uses 3B (Qwen2.5-3B-Instruct, full LoRA bf16) because its outputs are short enough to fit without quantization._
+
+### Smoke Test Results (Synthetic Data)
 
 | Metric               | HQQ 4-bit QLoRA (7B)     |
 | -------------------- | ------------------------ |
+| **Model VRAM**       | 5.85 GB                  |
 | **Peak VRAM**        | 10.09 GB                 |
 | **Speed**            | 3.0 s/step               |
 | **Quantization**     | HQQ 4-bit, group_size=64 |
 | **Trainable params** | 40.4M (0.92%)            |
-| **Model capacity**   | 7.6B total               |
 | **Backend**          | Pure PyTorch             |
 
-Key findings:
+### VRAM Budget Guide
 
-- **VRAM**: 5.85 GB after loading quantized model, 10.09 GB peak during training with gradient checkpointing
-- **Speed**: 3.0 seconds/step (batch_size=1, grad_accum=4, max_length=256)
-- **Headroom**: ~6 GB VRAM free at peak — room for longer sequences or larger batch sizes
+The main constraint is `max_length` — longer sequences need more activation memory:
+
+| max_length | Peak VRAM (7B HQQ) | Status                  |
+| ---------- | ------------------ | ----------------------- |
+| 256        | ~10 GB             | Comfortable             |
+| 1024       | ~12.2 GB           | Good (3.7 GB headroom)  |
+| 2048       | ~14.5 GB           | Tight (1.4 GB headroom) |
+| 4096       | OOM                | Exceeds 16 GB           |
+
+For 16GB GPUs, **max_length=1024 is the sweet spot** for 7B QLoRA training. Use gradient checkpointing (enabled by default in our scripts).
 
 ## Quick Start
 
@@ -116,18 +138,38 @@ python smoke_test.py
 ### Train a model
 
 ```bash
-python train.py judge-7b
+python train.py --model Qwen/Qwen2.5-7B-Instruct \
+    --data training_data.jsonl \
+    --output ./my-model \
+    --max-length 1024 \
+    --epochs 3
 ```
+
+## Patches We Discovered
+
+Three patches were needed beyond the standard HQQ + PEFT setup. None of these are documented elsewhere:
+
+### 1. HQQ dtype mismatch (critical)
+
+`prepare_model_for_kbit_training` upcasts some layers to float32, but HQQ's `matmul()` doesn't cast inputs to match. See `patches/apply_hqq_patch.py`.
+
+### 2. Python 3.14 torch.compile (if applicable)
+
+HQQ uses `@torch.compile()` as a class method decorator. Python 3.14 raises `RuntimeError: torch.compile is not supported on Python 3.14+`. Our scripts monkey-patch `torch.compile` to return an identity decorator.
+
+### 3. Clean LoRA merge for HQQ models
+
+After training, `model.merge_and_unload()` on an HQQ model produces tensors with HQQ-specific names (`W_q`, `meta`) that llama.cpp can't convert. The fix: save the LoRA adapter, reload the base model in bf16 (no HQQ), apply the adapter, then merge. See `train.py` for the implementation.
 
 ## Repository Structure
 
 ```
 .
-├── README.md                # This file
-├── smoke_test.py            # Quick validation — loads, quantizes, trains 10 steps
-├── train.py                 # Full training script with HQQ + LoRA
+├── README.md                     # This file
+├── smoke_test.py                 # Quick validation — loads, quantizes, trains 10 steps
+├── train.py                      # Full training script with HQQ + LoRA
 ├── patches/
-│   └── apply_hqq_patch.py   # Auto-patches HQQ dtype issue
+│   └── apply_hqq_patch.py        # Auto-patches HQQ dtype issue
 ├── docs/
 │   └── bitsandbytes-failure.md   # Detailed bitsandbytes failure analysis
 └── failed_approaches/
@@ -140,23 +182,20 @@ We tried building bitsandbytes from source with `cmake -DCOMPUTE_BACKEND=hip -DB
 
 **Fix path**: When PyTorch releases a wheel built against ROCm 7.2, bitsandbytes compiled from source should work. Until then, HQQ is the reliable alternative.
 
-## Additional Patches
-
-**Python 3.14+ compatibility**: HQQ uses `@torch.compile()` as a class method decorator, but `torch.compile` is not supported on Python 3.14+. The training scripts automatically monkey-patch `torch.compile` to return an identity decorator when running on Python 3.14+.
-
 ## Environment Variables
 
-| Variable                   | Purpose                                         | Example                    |
-| -------------------------- | ----------------------------------------------- | -------------------------- |
-| `HSA_OVERRIDE_GFX_VERSION` | Tell ROCm to treat your GPU as a known target   | `12.0.0`                   |
-| `DISABLE_CUDA`             | Skip CUDA kernel compilation during HQQ install | `1`                        |
-| `PYTORCH_HIP_ALLOC_CONF`   | Optional: tune HIP memory allocator             | `expandable_segments:True` |
+| Variable                   | Purpose                                          | Example                    |
+| -------------------------- | ------------------------------------------------ | -------------------------- |
+| `HSA_OVERRIDE_GFX_VERSION` | Tell ROCm to treat your GPU as a known target    | `12.0.0`                   |
+| `DISABLE_CUDA`             | Skip CUDA kernel compilation during HQQ install  | `1`                        |
+| `PYTORCH_ALLOC_CONF`       | Tune memory allocator (helps with fragmentation) | `expandable_segments:True` |
 
 ## Related Links
 
 - [HQQ GitHub](https://github.com/mobiusml/hqq) — Half-Quadratic Quantization
 - [PEFT HQQ support](https://huggingface.co/docs/peft/developer_guides/quantization#hqq) — LoRA on HQQ layers
 - [ROCm PyTorch compatibility matrix](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/3rd-party-support-matrix.html)
+- [Blog post: QLoRA on RDNA4](https://blog.vachsark.com/qlora-rdna4) — Extended writeup with context
 
 ## Contributing
 
