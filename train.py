@@ -34,9 +34,9 @@ if sys.version_info >= (3, 14):
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from hqq.core.quantize import HQQLinear, HQQBackend, BaseQuantizeConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
 from trl import SFTConfig, SFTTrainer
-from datasets import load_dataset
+from datasets import Dataset as HFDataset
 
 
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
@@ -81,6 +81,89 @@ def load_and_quantize(model_name: str, device: str = "cuda:0") -> AutoModelForCa
     return model
 
 
+def load_prompt_completion(data_file: str, tokenizer, max_length: int):
+    """Convert messages JSONL to prompt/completion format with smart truncation.
+
+    Pre-truncates prompts so prompt+completion fits within max_length.
+    Preserves system prompt and chat template structure — only truncates
+    the user message content from the MIDDLE (keeps start for task framing
+    and end for recent content).
+
+    Required for completion_only_loss=True which masks all prompt tokens.
+    """
+    max_completion_tokens = max_length // 2
+
+    records = []
+    truncated = 0
+    for line in open(data_file):
+        line = line.strip()
+        if not line:
+            continue
+        entry = json.loads(line)
+        messages = entry["messages"]
+        system_msgs = [m for m in messages if m["role"] == "system"]
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        completion_msgs = [m for m in messages if m["role"] == "assistant"]
+        completion_text = (completion_msgs[0]["content"] + "<|im_end|>\n"
+                           if completion_msgs else "")
+
+        completion_ids = tokenizer.encode(completion_text, add_special_tokens=False)
+        if len(completion_ids) > max_completion_tokens:
+            completion_ids = completion_ids[:max_completion_tokens]
+            completion_text = tokenizer.decode(completion_ids, skip_special_tokens=False)
+
+        skeleton_msgs = system_msgs + [{"role": "user", "content": ""}]
+        skeleton_text = tokenizer.apply_chat_template(
+            skeleton_msgs, tokenize=False, add_generation_prompt=True,
+        )
+        skeleton_ids = tokenizer.encode(skeleton_text, add_special_tokens=False)
+
+        available_for_user = max_length - len(skeleton_ids) - len(completion_ids)
+
+        user_content = user_msgs[0]["content"] if user_msgs else ""
+        user_ids = tokenizer.encode(user_content, add_special_tokens=False)
+
+        if len(user_ids) > available_for_user and available_for_user > 0:
+            truncated += 1
+            keep_start = available_for_user // 3
+            keep_end = available_for_user - keep_start
+            user_ids = user_ids[:keep_start] + user_ids[-keep_end:]
+            user_content = tokenizer.decode(user_ids, skip_special_tokens=False)
+
+        final_msgs = system_msgs + [{"role": "user", "content": user_content}]
+        prompt_text = tokenizer.apply_chat_template(
+            final_msgs, tokenize=False, add_generation_prompt=True,
+        )
+
+        records.append({"prompt": prompt_text, "completion": completion_text})
+
+    if truncated:
+        print(f"  Truncated {truncated}/{len(records)} user messages (middle-truncation)")
+    return HFDataset.from_list(records)
+
+
+def merge_hqq_safe(model_name: str, lora_dir: str, merged_dir: str, tokenizer):
+    """Merge LoRA adapter into base model without HQQ tensor names.
+
+    HQQ models have quantized tensor names (W_q, meta) that llama.cpp
+    can't convert. The fix: reload base model in bf16, apply LoRA adapter,
+    then merge. This produces clean tensor names.
+    """
+    print(f"Merging LoRA into base model -> {merged_dir}")
+    print("  HQQ path: reloading base model in bf16 for clean merge...")
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=torch.bfloat16, device_map="cpu",
+    )
+    merged = PeftModel.from_pretrained(base_model, lora_dir)
+    merged = merged.merge_and_unload()
+
+    os.makedirs(merged_dir, exist_ok=True)
+    merged.save_pretrained(merged_dir)
+    tokenizer.save_pretrained(merged_dir)
+    print(f"  Saved merged model to {merged_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="QLoRA fine-tuning with HQQ on AMD RDNA4")
     parser.add_argument("--model", required=True, help="HuggingFace model name")
@@ -90,10 +173,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=3, help="Training epochs (default: 3)")
     parser.add_argument("--batch-size", type=int, default=1, help="Per-device batch size (default: 1)")
     parser.add_argument("--grad-accum", type=int, default=8, help="Gradient accumulation steps (default: 8)")
-    parser.add_argument("--max-length", type=int, default=2560, help="Max sequence length (default: 2560)")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate (default: 2e-4)")
+    parser.add_argument("--max-length", type=int, default=1024, help="Max sequence length (default: 1024)")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate (default: 5e-5)")
     parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank (default: 16)")
     parser.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha (default: 32)")
+    parser.add_argument("--neftune-alpha", type=float, default=5.0, help="NEFTune noise alpha (default: 5, 0 to disable)")
     parser.add_argument("--no-merge", action="store_true", help="Skip merging LoRA into base model")
     args = parser.parse_args()
 
@@ -119,16 +203,33 @@ def main():
     # Pre-flight token length check
     print("Pre-flight: checking token lengths...")
     all_lengths = []
+    completion_lengths = []
     with open(args.data) as f:
         for line in f:
+            if not line.strip():
+                continue
             messages = json.loads(line)["messages"]
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
             all_lengths.append(len(tokenizer.encode(text)))
+            for m in messages:
+                if m["role"] == "assistant":
+                    completion_lengths.append(len(tokenizer.encode(m["content"], add_special_tokens=False)))
 
     train_count = len(all_lengths)
     print(f"  Examples: {train_count}")
     print(f"  Token lengths: min={min(all_lengths)}, max={max(all_lengths)}, "
           f"mean={statistics.mean(all_lengths):.0f}, median={statistics.median(all_lengths):.0f}")
+
+    if completion_lengths:
+        avg_input = statistics.mean(all_lengths) - statistics.mean(completion_lengths)
+        avg_comp = statistics.mean(completion_lengths)
+        ratio = avg_input / avg_comp if avg_comp > 0 else float("inf")
+        print(f"  Completion tokens: mean={avg_comp:.0f}, median={statistics.median(completion_lengths):.0f}")
+        print(f"  Input/output ratio: {ratio:.1f}x")
+        if ratio > 5:
+            print(f"  -> Using completion_only_loss (ratio > 5x, {ratio/(1+ratio)*100:.0f}% of loss would be wasted on input)")
+        else:
+            print(f"  -> Ratio OK for standard training, but completion_only_loss still recommended")
 
     truncated = sum(1 for l in all_lengths if l > args.max_length)
     if truncated > 0:
@@ -151,16 +252,13 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Load dataset
-    data_files = {"train": args.data}
+    # Load dataset in prompt/completion format for completion_only_loss
+    print("Loading training data (prompt/completion format)...")
+    train_ds = load_prompt_completion(args.data, tokenizer, args.max_length)
+    val_ds = None
     if args.val_data:
-        data_files["val"] = args.val_data
-    dataset = load_dataset("json", data_files=data_files)
-
-    def formatting_func(example):
-        return tokenizer.apply_chat_template(
-            example["messages"], tokenize=False, add_generation_prompt=False,
-        )
+        print("Loading validation data...")
+        val_ds = load_prompt_completion(args.val_data, tokenizer, args.max_length)
 
     # Training config
     effective_batch = args.batch_size * args.grad_accum
@@ -179,8 +277,8 @@ def main():
         lr_scheduler_type="cosine",
         warmup_steps=10,
         logging_steps=5,
-        eval_strategy="steps" if args.val_data else "no",
-        eval_steps=eval_steps if args.val_data else None,
+        eval_strategy="steps" if val_ds else "no",
+        eval_steps=eval_steps if val_ds else None,
         save_strategy="epoch",
         save_total_limit=2,
         bf16=True,
@@ -188,16 +286,17 @@ def main():
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to="none",
         seed=42,
+        completion_only_loss=True,
+        neftune_noise_alpha=args.neftune_alpha if args.neftune_alpha > 0 else None,
     )
 
     trainer_kwargs = {
         "model": model,
         "args": training_args,
-        "train_dataset": dataset["train"],
-        "formatting_func": formatting_func,
+        "train_dataset": train_ds,
     }
-    if args.val_data:
-        trainer_kwargs["eval_dataset"] = dataset["val"]
+    if val_ds:
+        trainer_kwargs["eval_dataset"] = val_ds
 
     trainer = SFTTrainer(**trainer_kwargs)
 
@@ -211,13 +310,10 @@ def main():
     trainer.save_model(lora_dir)
     tokenizer.save_pretrained(lora_dir)
 
-    # Merge
+    # Merge (HQQ-safe: reload base in bf16 -> apply LoRA -> merge)
     if not args.no_merge:
         merged_dir = os.path.join(args.output, "merged")
-        print(f"Merging LoRA into base model -> {merged_dir}")
-        merged_model = model.merge_and_unload()
-        merged_model.save_pretrained(merged_dir)
-        tokenizer.save_pretrained(merged_dir)
+        merge_hqq_safe(args.model, lora_dir, merged_dir, tokenizer)
 
     # Summary
     peak_vram = torch.cuda.max_memory_allocated() / 1e9
@@ -246,7 +342,9 @@ def main():
             "lr": args.lr,
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
+            "neftune_alpha": args.neftune_alpha,
             "quantization": "hqq-4bit",
+            "completion_only_loss": True,
         },
         "train_loss": train_loss,
         "peak_vram_gb": round(peak_vram, 2),

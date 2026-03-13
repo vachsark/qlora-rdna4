@@ -142,8 +142,69 @@ python train.py --model Qwen/Qwen2.5-7B-Instruct \
     --data training_data.jsonl \
     --output ./my-model \
     --max-length 1024 \
-    --epochs 3
+    --epochs 3 \
+    --lr 5e-5 \
+    --neftune-alpha 5
 ```
+
+The script automatically:
+
+- Converts data to prompt/completion format for `completion_only_loss`
+- Applies smart middle-truncation for long inputs
+- Adds NEFTune embedding noise for better generalization
+- Uses HQQ-safe merge (reload base in bf16 → apply LoRA → merge) for clean GGUF conversion
+
+## Gotchas (Lessons from Production)
+
+These cost us hours of debugging. Save yourself the pain.
+
+### 1. Ollama Modelfile MUST include chat template (silent, catastrophic)
+
+When registering a custom GGUF model with `ollama create`, you **must** include the model's chat template in the Modelfile. Without it, Ollama sends raw text — the model can't parse system/user/assistant roles and generates input continuations instead of following instructions.
+
+**Symptom**: Model outputs look like note content or Q&A instead of task-specific output. Looks like a training bug, but it's a deployment bug.
+
+**Fix**: Add the full ChatML template for Qwen2.5 models:
+
+```
+FROM your-model.Q8_0.gguf
+TEMPLATE """{{- if .Messages }}
+{{- if or .System .Tools }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ .Content }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+{{ end }}
+{{- end }}
+{{- end }}"""
+PARAMETER stop <|im_start|>
+PARAMETER stop <|im_end|>
+```
+
+### 2. completion_only_loss is mandatory for high input/output ratios
+
+If your training data has long inputs and short outputs (ratio > 5:1), you **must** use `completion_only_loss=True`. Without it, 85%+ of the gradient signal teaches the model to predict input tokens — the model learns "continue the input" instead of "follow instructions and produce output."
+
+Our training data had ratios from 6:1 to 28:1. All models trained without loss masking were completely broken (scored 0/5 on format compliance). The base model with no fine-tuning outperformed them all.
+
+**This is now the default in our `train.py` script.** The data is automatically converted to prompt/completion format with smart middle-truncation.
+
+### 3. Smart truncation: keep start + end, drop middle
+
+When inputs exceed `max_length`, don't use TRL's default right-truncation (which cuts off the completion) or simple left-truncation (which removes task framing headers). Instead, truncate from the **middle** of the user content:
+
+- **Keep the start (1/3)**: Contains task framing headers (e.g., `=== KNOWLEDGE JUDGE DATA ===`)
+- **Keep the end (2/3)**: Contains the most recent/relevant content
+- **Remove the middle**: Redundant intermediate content
+
+This preserves both the task instructions and the most relevant data.
 
 ## Patches We Discovered
 
