@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Training outputs
+output/
+*.gguf
+*.safetensors
+*.bin
+training-log.jsonl
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
