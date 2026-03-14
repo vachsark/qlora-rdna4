@@ -38,13 +38,15 @@ We trained 5 task-specific models from Qwen2.5-7B-Instruct using this pipeline:
 **Software**: PyTorch 2.9.1+rocm6.3, Python 3.14
 **Date**: 2026-03-13
 
-| Model                | Task                                  | Examples | Peak VRAM | Training Time | max_length | Final Loss | Eval Accuracy |
-| -------------------- | ------------------------------------- | -------- | --------- | ------------- | ---------- | ---------- | ------------- |
-| vault-judge-7b       | Knowledge quality evaluation          | 67       | 14.53 GB  | 20.5 min      | 2048       | 1.85       | 63.9%         |
-| vault-planner-7b     | Goal planning & prioritization        | 99       | 12.22 GB  | 13.8 min      | 1024       | 1.34       | 73.4%         |
-| vault-seeder-7b      | Research note synthesis               | 64       | 12.22 GB  | 8.7 min       | 1024       | 1.86       | 61.8%         |
-| vault-analyst-7b     | Technical analysis & recommendations  | 77       | 15.70 GB  | 24 min (est)  | 2048       | 1.24       | 69.5%         |
-| vault-reflector-3b\* | Session reflection & pattern analysis | 42       | 11.45 GB  | 11 min        | 2048       | —          | —             |
+| Model                | Task                                  | Examples | Peak VRAM | Training Time | max_length | Eval Loss |
+| -------------------- | ------------------------------------- | -------- | --------- | ------------- | ---------- | --------- |
+| vault-judge-7b       | Knowledge quality evaluation          | 67       | 14.53 GB  | 20.5 min      | 2048       | 1.84      |
+| vault-planner-7b     | Goal planning & prioritization        | 99       | 12.22 GB  | 13.8 min      | 1024       | 1.35      |
+| vault-seeder-7b      | Research note synthesis               | 64       | 12.22 GB  | 8.7 min       | 1024       | 1.96      |
+| vault-analyst-7b     | Technical analysis & recommendations  | 77       | 15.70 GB  | 24 min (est)  | 2048       | 1.32      |
+| vault-reflector-3b\* | Session reflection & pattern analysis | 42       | 11.45 GB  | 11 min        | 2048       | —         |
+
+**A note on eval loss:** This is a next-token prediction metric on held-out examples — it tells us the model learned the output format, not how well it performs the actual task. We're currently running shadow evaluation (fine-tuned model alongside Sonnet on identical inputs) to measure real task quality. Proper task-level benchmarks coming soon.
 
 _\*Reflector uses 3B (Qwen2.5-3B-Instruct, full LoRA bf16) because its outputs are short enough to fit without quantization._
 
