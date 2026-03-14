@@ -38,13 +38,13 @@ We trained 5 task-specific models from Qwen2.5-7B-Instruct using this pipeline:
 **Software**: PyTorch 2.9.1+rocm6.3, Python 3.14
 **Date**: 2026-03-13
 
-| Model                | Task                                  | Examples | Peak VRAM | Training Time | max_length |
-| -------------------- | ------------------------------------- | -------- | --------- | ------------- | ---------- |
-| vault-judge-7b       | Knowledge quality evaluation          | 67       | 14.50 GB  | 21 min        | 2048       |
-| vault-planner-7b     | Goal planning & prioritization        | 99       | 12.21 GB  | 14 min        | 1024       |
-| vault-seeder-7b      | Research note synthesis               | 64       | 12.21 GB  | 9 min         | 1024       |
-| vault-analyst-7b     | Technical analysis & recommendations  | 77       | 12.21 GB  | 11 min        | 1024       |
-| vault-reflector-3b\* | Session reflection & pattern analysis | 42       | 11.45 GB  | 11 min        | 2048       |
+| Model                | Task                                  | Examples | Peak VRAM | Training Time | max_length | Final Loss | Eval Accuracy |
+| -------------------- | ------------------------------------- | -------- | --------- | ------------- | ---------- | ---------- | ------------- |
+| vault-judge-7b       | Knowledge quality evaluation          | 67       | 14.53 GB  | 20.5 min      | 2048       | 1.85       | 63.9%         |
+| vault-planner-7b     | Goal planning & prioritization        | 99       | 12.22 GB  | 13.8 min      | 1024       | 1.34       | 73.4%         |
+| vault-seeder-7b      | Research note synthesis               | 64       | 12.22 GB  | 8.7 min       | 1024       | 1.86       | 61.8%         |
+| vault-analyst-7b     | Technical analysis & recommendations  | 77       | 15.70 GB  | 24 min (est)  | 2048       | 1.24       | 69.5%         |
+| vault-reflector-3b\* | Session reflection & pattern analysis | 42       | 11.45 GB  | 11 min        | 2048       | —          | —             |
 
 _\*Reflector uses 3B (Qwen2.5-3B-Instruct, full LoRA bf16) because its outputs are short enough to fit without quantization._
 
@@ -206,6 +206,14 @@ When inputs exceed `max_length`, don't use TRL's default right-truncation (which
 
 This preserves both the task instructions and the most relevant data.
 
+### 4. VRAM at 99% = silent hang, force-kill = GPU lockup
+
+At `max_length=2048`, our 7B HQQ training peaked at 15.7 GB out of 17.1 GB usable (99.5%). The process hung silently — GPU utilization dropped to 0%, CPU flatlined, but the process stayed alive in `hrtimer_nanosleep`. The log (piped through `tee`) stopped updating due to pipe buffering, making it look like progress was just delayed.
+
+**Worse**: force-killing (`kill -9`) the hung process left the GPU in an unrecoverable state. Both HIP/ROCm and Vulkan refused to initialize — even `ollama generate` hung. The only fix was a full reboot. Graceful SIGTERM had no effect on the hung process.
+
+**Lesson**: On 16GB RDNA4, `max_length=1024` (12.2 GB peak) is the safe ceiling for 7B HQQ training. `max_length=2048` (14.5-15.7 GB peak) works most of the time but can hang unpredictably. Always set `PYTORCH_ALLOC_CONF=expandable_segments:True` and monitor VRAM with `rocm-smi`. If a training process stops making progress, **reboot rather than force-kill**.
+
 ## Patches We Discovered
 
 Three patches were needed beyond the standard HQQ + PEFT setup. None of these are documented elsewhere:
@@ -241,7 +249,13 @@ After training, `model.merge_and_unload()` on an HQQ model produces tensors with
 
 We tried building bitsandbytes from source with `cmake -DCOMPUTE_BACKEND=hip -DBNB_ROCM_ARCH="gfx1200"`. It compiled successfully, but the resulting `libbitsandbytes_rocm72.so` links against ROCm 7.2's HSA runtime, while PyTorch 2.9.1+rocm6.3 bundles ROCm 6.3's runtime. See [`docs/bitsandbytes-failure.md`](docs/bitsandbytes-failure.md) for the full analysis.
 
-**Fix path**: When PyTorch releases a wheel built against ROCm 7.2, bitsandbytes compiled from source should work. Until then, HQQ is the reliable alternative.
+### Update (March 2026): bitsandbytes ROCm 7.2 builds now available
+
+bitsandbytes now ships pre-built wheels for ROCm 7.2 with **gfx1200/gfx1201 listed as supported**. The default blocksize of 64 for 4-bit quantization is now correct for ROCm. Combined with PyTorch 2.9.1+rocm7.2 wheels (available from `repo.radeon.com`), this should enable standard QLoRA without HQQ.
+
+**Status**: AMD marks this as "preview state." We haven't tested it yet — our training runs fine on HQQ and we're not eager to swap a working pipeline. If you try it, please open an issue with your results.
+
+**If bitsandbytes works for you**, the entire HQQ layer of this repo becomes unnecessary — you can use `BitsAndBytesConfig(load_in_4bit=True)` directly in transformers and skip the manual layer replacement + patches.
 
 ## Environment Variables
 
