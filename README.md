@@ -4,7 +4,9 @@
 
 AMD's RX 9070 XT (RDNA4, gfx1200/gfx1201) has 16GB VRAM — more than enough for 7B QLoRA training. But the standard quantization library `bitsandbytes` doesn't work on RDNA4. This repo documents the problem, the solution, and provides ready-to-use training scripts.
 
-**We used this to train 5 production models** (Qwen2.5-7B-Instruct) that run daily automated tasks — knowledge evaluation, goal planning, research synthesis, and more. All trained and deployed on a single consumer GPU.
+**We used this to train 13+ production models** that run daily automated tasks — knowledge evaluation, goal planning, research synthesis, and more. All trained and deployed on a single consumer GPU.
+
+**NEW (2026-03-15): 4B model beats 7B on format compliance.** Qwen3-4B fine-tuned with full LoRA (no quantization) scored 4.8/5 vs our production Qwen2.5-7B's 3.0/5. On a fixed VRAM budget, lossless weights + higher LoRA rank > more parameters + quantization noise. [Full writeup →](https://blog.vachsark.com/qwen3-bakeoff-fine-tuning)
 
 ## The Problem
 
@@ -32,23 +34,45 @@ This gives us 4-bit weights with bf16 compute — same effective setup as bitsan
 
 ## Production Results
 
-We trained 5 task-specific models from Qwen2.5-7B-Instruct using this pipeline:
+### Current Fleet (2026-03-15)
 
 **Hardware**: AMD RX 9070 XT (RDNA4, gfx1201, 16GB VRAM)
 **Software**: PyTorch 2.9.1+rocm6.3, Python 3.14
-**Date**: 2026-03-13
 
-| Model                | Task                                  | Examples | Peak VRAM | Training Time | max_length | Eval Loss |
-| -------------------- | ------------------------------------- | -------- | --------- | ------------- | ---------- | --------- |
-| vault-judge-7b       | Knowledge quality evaluation          | 67       | 14.53 GB  | 20.5 min      | 2048       | 1.84      |
-| vault-planner-7b     | Goal planning & prioritization        | 99       | 12.22 GB  | 13.8 min      | 1024       | 1.35      |
-| vault-seeder-7b      | Research note synthesis               | 64       | 12.22 GB  | 8.7 min       | 1024       | 1.96      |
-| vault-analyst-7b     | Technical analysis & recommendations  | 77       | 15.70 GB  | 24 min (est)  | 2048       | 1.32      |
-| vault-reflector-3b\* | Session reflection & pattern analysis | 42       | 11.45 GB  | 11 min        | 2048       | —         |
+| Model              | Base       | Method             | Examples | Peak VRAM    | Time     | max_length | Eval Loss | Format Score |
+| ------------------ | ---------- | ------------------ | -------- | ------------ | -------- | ---------- | --------- | ------------ |
+| **vault-judge-4b** | Qwen3-4B   | **Full LoRA bf16** | 63       | **13.37 GB** | 28 min   | 2048       | 1.74      | **4.8/5**    |
+| vault-planner-8b   | Qwen3-8B   | HQQ 4-bit QLoRA    | 99       | 13.44 GB     | 16 min   | 1024       | 1.44      | 5/5          |
+| vault-judge-7b     | Qwen2.5-7B | HQQ 4-bit QLoRA    | 67       | 14.53 GB     | 20.5 min | 2048       | 1.84      | 3.0/5        |
+| vault-seeder-7b    | Qwen2.5-7B | HQQ 4-bit QLoRA    | 64       | 12.22 GB     | 8.7 min  | 1024       | 1.96      | —            |
+| vault-analyst-7b   | Qwen2.5-7B | HQQ 4-bit QLoRA    | 77       | 15.70 GB     | 24 min   | 2048       | 1.32      | —            |
+| vault-reflector-3b | Qwen2.5-3B | Full LoRA bf16     | 42       | 11.45 GB     | 11 min   | 2048       | —         | —            |
 
-**A note on eval loss:** This is a next-token prediction metric on held-out examples — it tells us the model learned the output format, not how well it performs the actual task. We're currently running shadow evaluation (fine-tuned model alongside Sonnet on identical inputs) to measure real task quality. Proper task-level benchmarks coming soon.
+### The 4B vs 7B Discovery
 
-_\*Reflector uses 3B (Qwen2.5-3B-Instruct, full LoRA bf16) because its outputs are short enough to fit without quantization._
+The **Qwen3-4B fine-tuned model beats the Qwen2.5-7B fine-tuned model** on our judge task — despite Qwen3-4B scoring dead last (48% format compliance) in our base model bake-off. After fine-tuning:
+
+| Test Input          | Qwen2.5-7B (HQQ QLoRA) | Qwen3-4B (Full LoRA) |
+| ------------------- | ---------------------- | -------------------- |
+| Empty input         | 0/5                    | **5/5**              |
+| 3-note batch        | 5/5                    | **5/5**              |
+| Output judge format | 3/5                    | **5/5**              |
+| Short note          | 4/5                    | **5/5**              |
+| Wrong format        | 3/5                    | **4/5**              |
+| **Average**         | **3.0/5**              | **4.8/5**            |
+
+**Why?** On a fixed 16GB VRAM budget:
+
+|                    | Qwen3-8B (HQQ 4-bit)     | Qwen3-4B (Full bf16) |
+| ------------------ | ------------------------ | -------------------- |
+| Weight precision   | 4-bit (lossy)            | **bf16 (lossless)**  |
+| LoRA rank possible | r=16 (r=32 OOMs at 2048) | **r=32 easily**      |
+| Peak VRAM at 2048  | 15.95 GB (99.7%)         | **13.37 GB (83%)**   |
+| Trainable params   | 43.6M (0.92%)            | **66.1M (1.62%)**    |
+
+Lossless weights + higher LoRA rank + VRAM headroom > more parameters + quantization noise.
+
+**Full analysis: [blog.vachsark.com/qwen3-bakeoff-fine-tuning](https://blog.vachsark.com/qwen3-bakeoff-fine-tuning)**
 
 ### Smoke Test Results (Synthetic Data)
 
